@@ -1,63 +1,84 @@
-use clap::Parser;
-use nix::sys::stat;
-use nix::unistd;
-use tempfile::tempdir;
+use memmap::MmapMut;
+use nix::libc;
+use nix::{
+    sys::wait::waitpid,
+    unistd::{fork, ForkResult},
+};
+use os_pipe::pipe;
+use std::fs::OpenOptions;
+use std::io::{Read, Write};
+use std::path::PathBuf;
+use std::time::Instant;
 
-/// Benchmark various Unix IPC mechanisms
-#[derive(Parser, Debug)]
-#[command(version, about, long_about = None)]
-struct Args {
-    /// Message size in kilobytes
-    #[arg(short, long, default_value_t = 4)]
-    size_in_kilobytes: usize,
-    // TODO: allow selecting IPC mechanism to test
-}
-
-fn test_named_pipe() {
-    let tmp_dir = tempdir().unwrap();
-    let fifo_path = tmp_dir.path().join("foo.pipe");
-
-    match unistd::mkfifo(&fifo_path, stat::Mode::S_IRWXU) {
-        Ok(_) => println!("created {:?}", fifo_path),
-        Err(err) => println!("Error creating fifo: {}", err),
-    }
-
-    match fork() {
-        Ok(ForkResult::Parent { child, .. }) => {
-            let mut fifo_writer = std::fs::OpenOptions::new().write(true).open(FIFO_PATH)?;
-            fifo_writer.write_all(b"Hello, FIFO!")?;
-            child.wait()?;
-        }
-        Ok(ForkResult::Child) => {
-            let fifo_fd = unsafe {
-                libc::open(
-                    CString::new(FIFO_PATH).unwrap().as_ptr(),
-                    libc::O_RDONLY | libc::O_NONBLOCK,
-                )
-            };
-            let mut fifo_reader = unsafe { std::fs::File::from_raw_fd(fifo_fd) };
-            let mut buffer = [0u8; 1024];
-            loop {
-                match fifo_reader.read(&mut buffer) {
-                    Ok(0) => break, // EOF reached
-                    Ok(n) => {
-                        let data = String::from_utf8_lossy(&buffer[..n]);
-                        println!("Received: {}", data);
-                    }
-                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(std::time::Duration::from_millis(100));
-                    }
-                    Err(e) => {
-                        eprintln!("Error reading from FIFO: {}", e);
-                        break;
-                    }
-                }
-            }
-        }
-        Err(_) => eprintln!("Fork failed"),
-    }
-}
+const BUFFER_SIZE: usize = 4096 * 1024 * 1024;
 
 fn main() {
-    test_named_pipe();
+    println!("Benchmarking unnamed pipes");
+    unnamed_pipe();
+
+    println!("");
+
+    println!("Benchmarking shared memory");
+    shared_memory();
+}
+
+fn unnamed_pipe() {
+    let (mut reader, mut writer) = pipe().unwrap();
+
+    match unsafe { fork() } {
+        Ok(ForkResult::Parent { child, .. }) => {
+            let start = Instant::now();
+            let data = vec![0u8; BUFFER_SIZE];
+            writer.write_all(&data).unwrap();
+            let end = start.elapsed();
+            println!("Parrent -> Child took {}ms", end.as_millis());
+
+            waitpid(child, None).unwrap();
+        }
+        Ok(ForkResult::Child) => {
+            let start = Instant::now();
+            let mut data = vec![0u8; BUFFER_SIZE];
+            reader.read_exact(&mut data).unwrap();
+            let end = start.elapsed();
+            println!("Child -> Parrent took {}ms", end.as_millis());
+
+            unsafe { libc::_exit(0) };
+        }
+        Err(_) => println!("Fork failed"),
+    }
+}
+
+fn shared_memory() {
+    let path: PathBuf = "mapfile".into();
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(&path)
+        .unwrap();
+    file.set_len(BUFFER_SIZE as u64).unwrap();
+
+    let mut mmap = unsafe { MmapMut::map_mut(&file).unwrap() };
+
+    match unsafe { fork() } {
+        Ok(ForkResult::Parent { child, .. }) => {
+            let start = Instant::now();
+            let data = vec![0u8; BUFFER_SIZE];
+            mmap.copy_from_slice(&data);
+            let end = start.elapsed();
+            println!("Parrent -> Child took {}ms", end.as_millis());
+
+            waitpid(child, None).unwrap();
+        }
+        Ok(ForkResult::Child) => {
+            let start = Instant::now();
+            let mut data = vec![0u8; BUFFER_SIZE];
+            data.copy_from_slice(&mmap);
+            let end = start.elapsed();
+            println!("Child -> Parrent took {}ms", end.as_millis());
+
+            unsafe { libc::_exit(0) };
+        }
+        Err(_) => println!("Fork failed"),
+    }
 }
